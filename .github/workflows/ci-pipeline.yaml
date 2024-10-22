@@ -1,0 +1,121 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - 'refs/tags/**'
+    tags:
+      - '**-dev'
+      - '**-staging'
+      - '**-prod'
+  pull_request:
+    branches:
+      - main
+
+env:
+  TF_LOG: DEBUG
+jobs:
+  full-pipeline:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ env.GOOGLE_CLOUD_PROJECT }}
+          export_default_credentials: true
+
+      - name: Install Terraform v1.9.5 and Terragrunt v0.67.5(Terragrunt version upgraded)
+        run: |
+          sudo apt-get update && sudo apt-get install -y unzip
+          
+          if [ -f "/usr/local/bin/terraform" ]; then
+            echo "Terraform is already installed, skipping download and installation."
+          else
+            curl -LO https://releases.hashicorp.com/terraform/1.9.5/terraform_1.9.5_linux_amd64.zip
+            yes | unzip terraform_1.9.5_linux_amd64.zip
+            sudo mv terraform /usr/local/bin/
+          fi
+          
+          if [ -f "/usr/local/bin/terragrunt" ]; then
+            echo "Terragrunt is already installed, skipping download and installation."
+          else
+            curl -L https://github.com/gruntwork-io/terragrunt/releases/download/v0.67.5/terragrunt_linux_amd64 -o terragrunt
+            chmod +x terragrunt
+            sudo mv terragrunt /usr/local/bin/
+          fi
+
+      - name: Set Environment Variables Based on Tags and Ensure No Path Duplication
+        run: |
+          echo "GITHUB_REF is $GITHUB_REF"
+          case "$GITHUB_REF" in
+            refs/tags/*-dev) ENV="dev";;
+            refs/tags/*-staging) ENV="staging";;
+            refs/tags/*-prod) ENV="prod";;
+            *) ENV="dev";;
+          esac
+          
+          BASE_PATH="terraform/envs/$ENV/terragrunt.hcl"
+          echo "TERRAGRUNT_CONFIG=$BASE_PATH" >> $GITHUB_ENV
+          echo "ENV=$ENV" >> $GITHUB_ENV  # Export ENV variable to be used in other steps
+          echo "Set TERRAGRUNT_CONFIG to $BASE_PATH"
+          echo "Environment set to ---> $ENV"
+          echo "Full path to terragrunt.hcl: ${{ github.workspace }}/$BASE_PATH"
+
+
+      - name: Terragrunt Initialize
+        run: |
+          terragrunt init \
+            --terragrunt-config=${{ github.workspace }}/terraform/envs/${{ env.ENV }}/terragrunt.hcl \
+            -backend-config="bucket=${{ secrets.TERRAFORM_BUCKET_NAME }}" \
+            -backend-config="prefix=terraform/state/${{ env.ENV }}"
+
+      # - name: Import Google Cloud Resources if they exist
+      #   run: |
+      #     BUCKET_NAME="cdn-q1-bucket-${{ env.ENV }}"
+      #     VPC_NAME="projects/iac-infra/global/networks/vpc-${{ env.ENV }}"
+
+
+      #     # In dev Environments both cdn, cdn bucket, vpc are already managed because of ci's temporary cache I did this
+      #     if ! terragrunt state list --terragrunt-config=${{ github.workspace }}/terraform/envs/${{ env.ENV }}/terragrunt.hcl | grep google_storage_bucket.cdn_bucket; then
+      #       echo "Bucket not in state, importing with Terragrunt..."
+      #       terragrunt import --terragrunt-config=${{ github.workspace }}/terraform/envs/${{ env.ENV }}/terragrunt.hcl google_storage_bucket.cdn_bucket $BUCKET_NAME
+      #     else
+      #       echo "Bucket already in state, skipping import."
+      #     fi
+
+      #     # Check if VPC is already in Terragrunt state
+      #     if ! terragrunt state list --terragrunt-config=${{ github.workspace }}/terraform/envs/${{ env.ENV }}/terragrunt.hcl | grep google_compute_network.vpc; then
+      #       echo "VPC not in state, importing with Terragrunt..."
+      #       terragrunt import --terragrunt-config=${{ github.workspace }}/terraform/envs/${{ env.ENV }}/terragrunt.hcl google_compute_network.vpc $VPC_NAME
+      #     else
+      #       echo "VPC already in state, skipping import."
+      #     fi
+
+      - name: Validate Terragrunt Configuration
+        run: |
+          terragrunt validate \
+            --terragrunt-config=${{ github.workspace }}/terraform/envs/${{ env.ENV }}/terragrunt.hcl
+
+      - name: Terragrunt Plan for Pull Requests
+        if: github.event_name == 'pull_request'
+        run: |
+          terragrunt plan \
+            --terragrunt-config=${{ github.workspace }}/terraform/envs/${{ env.ENV }}/terragrunt.hcl \
+            -lock=false -out plan.tfplan
+
+      - name: Apply Terragrunt Infrastructure on Main Branch
+        if: github.ref == 'refs/heads/main' || (startsWith(github.ref, 'refs/tags/') && (endsWith(github.ref, '-dev') || endsWith(github.ref, '-staging') || endsWith(github.ref, '-prod')))
+        run: |
+          terragrunt apply \
+            --terragrunt-config=${{ github.workspace }}/terraform/envs/${{ env.ENV }}/terragrunt.hcl \
+            -lock=false -auto-approve
+
